@@ -56,9 +56,7 @@ jobs:
           \tpull_package xz-utils
           \tpull_package libandroid-shmem
           \tpull_package libandroid-spawn
-          \tpull_package libiconv
-          \tpull_package libjpeg-turbo
-          \tpull_package littlecms"""
+          \tpull_package libandroid-support"""
           modified_code, count = re.subn(pattern, replacement, code, flags=re.DOTALL)
           if count == 0:
               print("Error: Could not find package list block in generate-bootstraps.sh")
