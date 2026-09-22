@@ -12,7 +12,15 @@ The build pipeline follows a three-stage process:
 
 2. **Patch** -- A Python post-processing script (`patch_prefix.py`) extracts each bootstrap ZIP and replaces all occurrences of `com.termux` with `com.hostcraft.android` in text files (shell scripts, config files, symlink maps, dpkg metadata, etc.). ELF binaries are detected via magic byte inspection and left untouched.
 
-3. **Release** -- The patched archives are re-zipped and published as GitHub Release assets, ready to be downloaded by the HostCraft app at install time.
+3. **Integrate frpc** -- The pipeline queries `https://api.github.com/repos/fatedier/frp/releases/latest`, downloads the matching `frpc` executable for each arch, and installs it as `bin/frpc` (mode `0755`) with a version stamp at `bin/FRPC_VERSION`. Mapping (first hit wins):
+
+   - `aarch64` <- `android_arm64` (fallback `linux_arm64`)
+   - `arm` <- `linux_arm` (fallback `linux_arm_hf`, no 32-bit android asset published)
+   - `x86_64` <- `linux_amd64` (emulators, no android asset published)
+
+   Pin a specific version via manual trigger input `frpc_version` (e.g. `v0.71.0`); default is `latest`.
+
+4. **Release** -- The patched archives are re-zipped and published as GitHub Release assets, ready to be downloaded by the HostCraft app at install time.
 
 ## Architectures
 
@@ -32,7 +40,7 @@ The pipeline runs automatically:
 - On a recurring schedule (every 5 days)
 - On manual trigger via `workflow_dispatch`
 
-Manual triggers allow overriding the target package name if needed.
+Manual triggers allow overriding the target package name and pinning the frpc version (`frpc_version`, default `latest`) if needed.
 
 ## Repository Structure
 
@@ -66,7 +74,7 @@ Download the latest release asset for your target architecture:
 https://github.com/<owner>/hostcraft-bootstrap-packages/releases/latest/download/bootstrap-aarch64.zip
 ```
 
-The ZIP contains the full `usr/` prefix tree. Extract it to your app's files directory:
+The ZIP contains the full `usr/` prefix tree plus the bundled `bin/frpc` client (see `bin/FRPC_VERSION` for the exact upstream tag). Extract it to your app's files directory:
 
 ```
 /data/data/com.hostcraft.android/files/usr/

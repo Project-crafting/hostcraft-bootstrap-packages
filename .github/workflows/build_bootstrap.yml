@@ -12,6 +12,10 @@ on:
         description: 'Target Android Package Name'
         required: true
         default: 'com.hostcraft.android'
+      frpc_version:
+        description: 'frpc version (tag like v0.71.0 or "latest")'
+        required: false
+        default: 'latest'
 
 permissions:
   contents: write
@@ -70,9 +74,13 @@ jobs:
           '
           ./scripts/generate-bootstraps.sh --architectures ${{ matrix.arch }}
 
-      - name: Post-process bootstrap (replace com.termux)
+      - name: Post-process bootstrap (replace com.termux + integrate frpc)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           PACKAGE_NAME="${{ github.event.inputs.package_name || 'com.hostcraft.android' }}"
+          FRPC_INPUT="${{ github.event.inputs.frpc_version || 'latest' }}"
           ARCH="${{ matrix.arch }}"
 
           cd termux-packages
@@ -92,14 +100,80 @@ jobs:
             echo "[+] Patched SYMLINKS.txt"
           fi
 
-          # Re-zip the bootstrap
+          # ---- Integrate latest frpc (https://github.com/fatedier/frp/releases) ----
+          # Map Termux arch -> frp asset OS_ARCH candidates (first hit wins).
+          # aarch64 prefers android_arm64 (dynamic, /system/bin/linker64), falls back to linux_arm64 (static).
+          # arm has no android 32-bit asset, so use static linux_arm (fallback linux_arm_hf).
+          # x86_64 (emulators) has no android asset, so use static linux_amd64.
+          case "$ARCH" in
+            aarch64) FRP_TRIES="android_arm64 linux_arm64" ;;
+            arm)     FRP_TRIES="linux_arm linux_arm_hf" ;;
+            x86_64) FRP_TRIES="linux_amd64" ;;
+            *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
+          esac
+
+          if [ -z "${FRPC_INPUT:-}" ] || [ "$FRPC_INPUT" = "latest" ]; then
+            echo "[*] Resolving latest frp release..."
+            if [ -n "${GH_TOKEN:-}" ]; then
+              FRP_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)
+            else
+              FRP_TAG=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)
+            fi
+          else
+            FRP_TAG="$FRPC_INPUT"
+            # Normalise bare version (0.71.0) to tag (v0.71.0)
+            case "$FRP_TAG" in
+              v*) ;;
+              *) FRP_TAG="v${FRP_TAG}" ;;
+            esac
+          fi
+          if [ -z "${FRP_TAG:-}" ] || [ "$FRP_TAG" = "null" ]; then
+            echo "Failed to resolve frp version" >&2; exit 1
+          fi
+          FRP_VER="${FRP_TAG#v}"
+          echo "[*] Target frp version: ${FRP_TAG} (arch candidates: ${FRP_TRIES})"
+
+          FRP_TMP="$(mktemp -d)"
+          trap 'rm -rf "$FRP_TMP"' EXIT
+          FRP_OK=""
+          for TRY in $FRP_TRIES; do
+            FRP_ASSET="frp_${FRP_VER}_${TRY}.tar.gz"
+            FRP_URL="https://github.com/fatedier/frp/releases/download/${FRP_TAG}/${FRP_ASSET}"
+            echo "[*] Trying ${FRP_URL} ..."
+            if curl -fsSL -o "${FRP_TMP}/frp.tar.gz" "$FRP_URL"; then
+              echo "[+] Downloaded ${FRP_ASSET}"
+              FRP_OK="$TRY"
+              break
+            else
+              echo "[-] Not found: ${FRP_ASSET}, trying next..."
+            fi
+          done
+          if [ -z "$FRP_OK" ]; then
+            echo "Failed to download frpc for arch ${ARCH} (tried: ${FRP_TRIES})" >&2; exit 1
+          fi
+
+          tar xzf "${FRP_TMP}/frp.tar.gz" -C "$FRP_TMP"
+          FRPC_SRC=$(find "$FRP_TMP" -maxdepth 2 -type f -name frpc | head -n 1)
+          if [ -z "$FRPC_SRC" ]; then
+            echo "frpc binary not found in archive" >&2; exit 1
+          fi
+          mkdir -p bootstrap-extracted/bin
+          cp -f "$FRPC_SRC" bootstrap-extracted/bin/frpc
+          chmod 0755 bootstrap-extracted/bin/frpc
+          echo "${FRP_TAG} ${FRP_OK}" > bootstrap-extracted/bin/FRPC_VERSION
+          echo "[+] Integrated frpc ${FRP_TAG} (${FRP_OK}) -> bin/frpc"
+          file bootstrap-extracted/bin/frpc || true
+          rm -rf "$FRP_TMP"
+          trap - EXIT
+
+          # Re-zip the bootstrap (use '.' so dotfiles are included)
           rm -f bootstrap-${ARCH}.zip
           cd bootstrap-extracted
-          zip -r9 ../bootstrap-${ARCH}.zip ./*
+          zip -r9 ../bootstrap-${ARCH}.zip .
           cd ..
           rm -rf bootstrap-extracted
 
-          echo "[*] Re-packaged bootstrap-${ARCH}.zip with prefix: ${PACKAGE_NAME}"
+          echo "[*] Re-packaged bootstrap-${ARCH}.zip with prefix: ${PACKAGE_NAME} + frpc ${FRP_TAG}"
 
       - name: Upload bootstrap zip as artifact
         uses: actions/upload-artifact@v4
@@ -123,14 +197,37 @@ jobs:
         run: |
           echo "version=bootstrap-$(date '+%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
 
+      - name: Resolve frpc version for release notes
+        id: frpc_version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT="${{ github.event.inputs.frpc_version || 'latest' }}"
+          if [ -z "$INPUT" ] || [ "$INPUT" = "latest" ]; then
+            if [ -n "${GH_TOKEN:-}" ]; then
+              TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)
+            else
+              TAG=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)
+            fi
+          else
+            TAG="$INPUT"
+            case "$TAG" in v*) ;; *) TAG="v$TAG" ;; esac
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "frpc $TAG"
+
       - name: Create GitHub Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.version }}
           name: Custom Bootstrap Release ${{ steps.get_version.outputs.version }}
           body: |
-            Custom bootstrap archives with patched prefix for HostCraft.
+            Custom bootstrap archives with patched prefix for HostCraft + bundled frpc.
 
             Patched prefix: `/data/data/${{ github.event.inputs.package_name || 'com.hostcraft.android' }}/files/usr`
+            frpc: `${{ steps.frpc_version.outputs.tag }}` from https://github.com/fatedier/frp/releases (binary at `bin/frpc`, version stamp at `bin/FRPC_VERSION`)
+              - aarch64 <- android_arm64 (fallback linux_arm64)
+              - arm <- linux_arm (fallback linux_arm_hf)
+              - x86_64 <- linux_amd64
             ELF binaries retain original hardcoded paths (handled at runtime by the app).
           files: bootstraps/*.zip
